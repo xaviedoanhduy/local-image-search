@@ -13,7 +13,8 @@ app = FastAPI(title="Local Image Search")
 
 # Global state - loaded on startup
 model = None
-tokenizer = None
+processor = None
+device = None
 embeddings_df = None
 
 
@@ -23,8 +24,10 @@ class SearchRequest(BaseModel):
 
 
 class SearchResult(BaseModel):
+    filename: str
     path: str
     score: float
+    drive_url: str | None = None
 
 
 class SearchResponse(BaseModel):
@@ -35,10 +38,10 @@ class SearchResponse(BaseModel):
 @app.on_event("startup")
 async def startup():
     """Load model and embeddings on startup."""
-    global model, tokenizer, embeddings_df
+    global model, processor, device, embeddings_df
 
-    print("Loading CLIP model...")
-    model, tokenizer, _ = load_model()
+    print("Loading SigLIP model...")
+    model, processor, device = load_model()
 
     print("Loading embeddings...")
     if Path(DB_PATH).exists():
@@ -62,12 +65,14 @@ async def search(request: SearchRequest):
         return SearchResponse(results=[], total_images=0)
 
     # Embed the query text
-    query_embedding = embed_text(model, tokenizer, request.query)
+    query_embedding = embed_text(request.query, model, processor, device)
 
     # Get all embeddings and paths
     data = embeddings_df.to_pydict()
     paths = data["path"]
     vectors = data["vector"]
+    drive_urls = data.get("drive_url", [None] * len(paths))
+    filenames = data.get("filename", [None] * len(paths))
 
     # Compute similarities
     scores = []
@@ -80,14 +85,16 @@ async def search(request: SearchRequest):
             scores.append(cosine_similarity(query_embedding, vec_array))
 
     # Sort by score descending
-    ranked = sorted(zip(paths, scores), key=lambda x: x[1], reverse=True)
+    ranked = sorted(zip(paths, scores, drive_urls, filenames), key=lambda x: x[1], reverse=True)
 
     # Return top results
-    results = [
-        SearchResult(path=path, score=score)
-        for path, score in ranked[:request.limit]
-        if score > 0  # exclude failed images
-    ]
+    results = []
+    for path, score, drive_url, filename in ranked[:request.limit]:
+        if score <= 0:
+            continue
+        url = drive_url if drive_url and str(drive_url) not in ("None", "nan", "") else None
+        name = filename if filename and str(filename) not in ("None", "nan", "") else Path(path).name
+        results.append(SearchResult(filename=name, path=path, score=score, drive_url=url))
 
     return SearchResponse(results=results, total_images=len(paths))
 

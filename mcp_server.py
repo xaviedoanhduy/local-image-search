@@ -4,7 +4,6 @@
 import fcntl
 import os
 import random
-import subprocess
 import sys
 import threading
 import time
@@ -14,7 +13,7 @@ import daft
 import numpy as np
 from mcp.server.fastmcp import FastMCP
 
-from core import load_model, embed_text, cosine_similarity, DB_PATH, MODEL_PATH, DEFAULT_EXCLUDE_DIRS
+from core import load_model, embed_text, cosine_similarity, DB_PATH, DEFAULT_EXCLUDE_DIRS
 from embed import sync_embeddings
 
 # File-based lock to prevent concurrent refreshes across processes
@@ -31,7 +30,8 @@ mcp = FastMCP("local-image-search")
 
 # Global state - loaded on startup
 model = None
-tokenizer = None
+processor = None
+device = None
 embeddings_df = None
 image_dir = None
 exclude_dirs = None  # Directories to exclude from scanning
@@ -89,7 +89,7 @@ def search_images(query: str, limit: int = 5) -> list[dict]:
     Returns:
         List of matching images with paths and similarity scores
     """
-    global model, tokenizer, embeddings_df
+    global model, processor, device, embeddings_df
 
     # Check if service is ready
     status = get_status_info()
@@ -97,73 +97,44 @@ def search_images(query: str, limit: int = 5) -> list[dict]:
         return [status]
 
     # Embed the query text
-    query_embedding = embed_text(model, tokenizer, query)
+    query_embedding = embed_text(query, model, processor, device)
 
     # Get all embeddings and paths
     data = embeddings_df.to_pydict()
     paths = data["path"]
     vectors = data["vector"]
+    drive_urls = data.get("drive_url", [None] * len(paths))
+    filenames = data.get("filename", [None] * len(paths))
 
     # Compute similarities
     scores = []
-    for i, vec in enumerate(vectors):
+    for vec in vectors:
         vec_array = np.array(vec, dtype=np.float32)
-        # Skip zero vectors (failed images)
         if np.allclose(vec_array, 0):
             scores.append(-1.0)
         else:
             scores.append(cosine_similarity(query_embedding, vec_array))
 
     # Sort by score descending
-    ranked = sorted(zip(paths, scores), key=lambda x: x[1], reverse=True)
+    ranked = sorted(
+        zip(paths, scores, drive_urls, filenames),
+        key=lambda x: x[1],
+        reverse=True,
+    )
 
     # Return top results
-    results = [
-        {"path": path, "score": round(score, 3)}
-        for path, score in ranked[:limit]
-        if score > 0  # exclude failed images
-    ]
+    results = []
+    for path, score, drive_url, filename in ranked[:limit]:
+        if score <= 0:  # exclude failed images
+            continue
+        entry = {"path": path, "score": round(score, 3)}
+        if drive_url and str(drive_url) not in ("None", "nan", ""):
+            entry["drive_url"] = drive_url
+        name = filename if filename and str(filename) not in ("None", "nan", "") else Path(path).name
+        entry["filename"] = name
+        results.append(entry)
 
     return results
-
-
-def ensure_model_exists():
-    """Download and convert CLIP model if not present."""
-    model_path = Path(MODEL_PATH)
-
-    # Check if model exists (look for model.safetensors or model.safetensors.index.json)
-    if (model_path / "model.safetensors").exists() or (model_path / "model.safetensors.index.json").exists():
-        return True
-
-    log("Model not found. Downloading and converting CLIP model (~600MB)...")
-    log("This only needs to happen once.")
-
-    # Run convert.py from the clip directory
-    clip_dir = model_path.parent
-    convert_script = clip_dir / "convert.py"
-
-    if not convert_script.exists():
-        log(f"Error: convert.py not found at {convert_script}")
-        return False
-
-    try:
-        result = subprocess.run(
-            [sys.executable, str(convert_script)],
-            cwd=str(clip_dir),
-            capture_output=True,
-            text=True
-        )
-
-        if result.returncode != 0:
-            log(f"Error downloading model: {result.stderr}")
-            return False
-
-        log("Model downloaded and converted successfully.")
-        return True
-
-    except Exception as e:
-        log(f"Error downloading model: {e}")
-        return False
 
 
 def reload_embeddings():
@@ -203,7 +174,7 @@ def embedding_refresh_loop():
         try:
             if image_dir and image_dir.exists():
                 log(f"Starting embedding refresh for {image_dir}...")
-                sync_embeddings(image_dir, log_fn=log, exclude_dirs=exclude_dirs)
+                sync_embeddings(image_dir, log_fn=log, exclude_dirs=exclude_dirs, model=model, processor=processor, device=device)
                 reload_embeddings()
             else:
                 log(f"Image directory not set or doesn't exist: {image_dir}")
@@ -217,19 +188,18 @@ def embedding_refresh_loop():
 
 
 def startup_task():
-    """Background task to download model and load embeddings."""
-    global model, tokenizer, embeddings_df, image_dir, model_loading
+    """Background task to load model and embeddings."""
+    global model, processor, device, embeddings_df, image_dir, model_loading
 
     model_loading = True
 
-    # Ensure model exists (download if needed)
-    if not ensure_model_exists():
-        log("Failed to download model.")
+    log("Loading SigLIP model (downloads on first run, ~800MB)...")
+    try:
+        model, processor, device = load_model()
+    except Exception as e:
+        log(f"Failed to load model: {e}")
         model_loading = False
         return
-
-    log("Loading CLIP model...")
-    model, tokenizer, _ = load_model()
     model_loading = False
 
     log("Loading embeddings...")

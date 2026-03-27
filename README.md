@@ -1,20 +1,23 @@
 # Local Image Search MCP
 
-Give your AI coding agent the ability to search through all your local images. Privacy-first, 100% local MCP server for macOS. Uses MLX CLIP for embeddings, Daft for batch processing, and Lance for vector storage.
+Give your AI coding agent the ability to search through your local images and Google Drive photos. Cross-platform MCP server (Linux, macOS, Windows). Uses SigLIP (HuggingFace) for embeddings, Daft for batch processing, and Lance for vector storage.
 
 https://github.com/user-attachments/assets/41e167f0-bb73-4310-8c1c-4be07af21cc1
 
 ## Features
 
-- **100% local** - Images and embeddings never leave your machine
-- **MCP Server** - Works with Claude Code and Claude Desktop
-- **Natural language search** - Find images by describing them
-- **Fast** - [260+ images/second](#real-world-performance-m4-max-home-directory) on Apple Silicon via MLX
+- **Cross-platform** — runs on Linux, macOS, and Windows (CPU or CUDA)
+- **Google Drive support** — index photos directly from a Drive folder, no local download needed
+- **MCP Server** — works with Claude Code and Claude Desktop
+- **Natural language search** — find images by describing them ("person wearing a watch", "sunset by the ocean")
+- **Better quality** — SigLIP so400m-patch14-384 outperforms CLIP base for fine-grained details
+- **Incremental sync** — re-runs skip unchanged files; Drive entries are preserved across local syncs
 
 ## Requirements
 
-- macOS with Apple Silicon (M1/M2/M3/M4)
-- [uv](https://docs.astral.sh/uv/getting-started/installation/) (for `uvx` command)
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)
+- CUDA GPU (optional, but speeds up embedding significantly)
 
 ## Quick Start
 
@@ -22,16 +25,16 @@ https://github.com/user-attachments/assets/41e167f0-bb73-4310-8c1c-4be07af21cc1
 
 **Option 1: CLI**
 ```bash
-claude mcp add local-image-search -- uvx local-image-search
+claude mcp add local-image-search -- uvx local-image-search ~/Pictures
 ```
 
-**Option 2: Manual** - add to `~/.claude.json`:
+**Option 2: Manual** — add to `~/.claude.json`:
 ```json
 {
   "mcpServers": {
     "local-image-search": {
       "command": "uvx",
-      "args": ["local-image-search"]
+      "args": ["local-image-search", "/home/user/Pictures"]
     }
   }
 }
@@ -39,45 +42,46 @@ claude mcp add local-image-search -- uvx local-image-search
 
 ### Claude Desktop
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+Add to your Claude Desktop config:
 ```json
 {
   "mcpServers": {
     "local-image-search": {
       "command": "uvx",
-      "args": ["local-image-search"]
+      "args": ["local-image-search", "/home/user/Pictures"]
     }
   }
 }
 ```
 
-Restart Claude after setup. The first run downloads the model (~600MB) and embeds your images, which may take a few minutes. After that, it only processes new or changed files. By default, it scans your home directory (`~`) and skips common system folders. See [Configuration Logic](#configuration-logic) for details.
+Restart Claude after setup. The first run downloads the SigLIP model (~800MB) and embeds your images. After that, only new or changed files are processed.
 
 ### Custom Configuration
 
 **Scan a specific folder:**
 ```json
-{
-  "args": ["local-image-search", "~/Pictures"]
-}
+{ "args": ["local-image-search", "~/Pictures"] }
 ```
 
 **Custom excludes:**
 ```json
 {
   "args": ["local-image-search"],
-  "env": {
-    "EXCLUDE_DIRS": "Downloads,Desktop,Movies"
-  }
+  "env": { "EXCLUDE_DIRS": "Downloads,Desktop,Movies" }
 }
 ```
 
 **Faster refresh:**
 ```json
 {
-  "env": {
-    "REFRESH_INTERVAL": "30"
-  }
+  "env": { "REFRESH_INTERVAL": "30" }
+}
+```
+
+**Different model** (e.g. a smaller/faster one):
+```json
+{
+  "env": { "IMAGE_SEARCH_MODEL": "openai/clip-vit-large-patch14" }
 }
 ```
 
@@ -94,26 +98,22 @@ Restart Claude after setup. The first run downloads the model (~600MB) and embed
 
 ### MCP Tools
 
-- `search_images(query, limit)` - Search for images matching a text description
-- `get_status()` - Check if the service is ready (model loaded, embeddings synced)
+- `search_images(query, limit)` — search for images by text description; returns `filename`, `path`, `score`, and `drive_url` (Drive results only)
+- `get_status()` — check if the service is ready (model loaded, embeddings synced)
 
 ## Development Setup
 
 ```bash
-# Clone the repo
-git clone https://github.com/Eventual-Inc/local-image-search.git
+git clone https://github.com/xaviedoanhduy/local-image-search.git
 cd local-image-search
-
-# Install dependencies
 uv sync
-
-# Download and convert CLIP model (~600MB, first time only)
-cd clip && uv run python convert.py && cd ..
 ```
+
+The SigLIP model (~800MB) downloads automatically from HuggingFace on first use.
 
 ## CLI Usage
 
-### Embed images from a directory
+### Index images from a local directory
 ```bash
 uv run python embed.py ~/Pictures           # embed all images
 uv run python embed.py ~/Pictures --dry-run # count and estimate time
@@ -122,31 +122,29 @@ uv run python embed.py . --no-recursive     # current dir only
 
 Embeddings are cached in `embeddings.lance/`. Re-running skips unchanged files.
 
-### Supported formats
+### Index images from Google Drive
 
-| Format | Extensions | Tested |
-|--------|------------|--------|
-| JPEG | `.jpg`, `.jpeg` | Created and embedded |
-| PNG | `.png` | Created and embedded |
-| GIF | `.gif` | Created and embedded |
-| WebP | `.webp` | Created and embedded |
-| BMP | `.bmp` | Created and embedded |
-| TIFF | `.tiff`, `.tif` | Created and embedded |
-| HEIC/HEIF | `.heic`, `.heif` | Real iPhone photo + converted PNG |
+```bash
+# One-time setup — see "Google Drive Setup" below
+uv run python embed.py --drive-folder <folder-id-or-url>
 
-Corrupted or unreadable images get zero vectors (won't match searches).
+# Or combine local + Drive in one pass
+uv run python embed.py ~/Pictures --drive-folder <folder-id-or-url>
+```
+
+Drive entries are stored alongside local entries with a `drive_url` pointing back to the original file. They are preserved when re-running local syncs.
 
 ### Search
 
-Start the server (loads model once):
+Start the FastAPI server (loads model once):
 ```bash
 uv run python server.py
 ```
 
 Search via CLI:
 ```bash
-uv run python search.py "sunset"           # list results
-uv run python search.py "people" -n 10     # show 10 results
+uv run python search.py "sunset"        # list results
+uv run python search.py "people" -n 10  # show 10 results
 ```
 
 Or via API:
@@ -156,74 +154,60 @@ curl -X POST http://127.0.0.1:8000/search \
   -d '{"query": "yellow mouse", "limit": 5}'
 ```
 
-### Demo scripts
+### Supported formats
+
+| Format | Extensions |
+|--------|------------|
+| JPEG | `.jpg`, `.jpeg` |
+| PNG | `.png` |
+| GIF | `.gif` |
+| WebP | `.webp` |
+| BMP | `.bmp` |
+| TIFF | `.tiff`, `.tif` |
+| HEIC/HEIF | `.heic`, `.heif` |
+
+Corrupted or unreadable images get zero vectors (won't appear in search results).
+
+## Google Drive Setup
+
+Google Drive indexing requires a one-time OAuth2 setup:
+
+1. Go to [console.cloud.google.com](https://console.cloud.google.com)
+2. Create a project → enable **Google Drive API**
+3. Create credentials → **OAuth client ID** → **Desktop app** → download JSON
+4. Save the downloaded file as `credentials.json` in the project directory
+5. Run `embed.py --drive-folder <id>` — a browser window opens for consent on first run
+6. The token is saved to `token.json` (auto-refreshed on subsequent runs)
+
 ```bash
-uv run python simple_image_search.py  # basic in-memory search (2 images)
-uv run python daft_image_search.py    # batch processing demo
+# Folder ID from URL: https://drive.google.com/drive/folders/<FOLDER_ID>
+uv run python embed.py --drive-folder 1ABC123xyz...
+# Or pass the full URL directly
+uv run python embed.py --drive-folder "https://drive.google.com/drive/folders/1ABC123xyz..."
 ```
+
+> `credentials.json` and `token.json` are gitignored — never commit them.
 
 ## Project Structure
 
 ```
 local-image-search/
-├── clip/                    # MLX CLIP implementation (from ml-explore/mlx-examples)
-│   ├── model.py             # CLIP model architecture
-│   ├── clip.py              # Model loading and inference
-│   ├── convert.py           # HuggingFace to MLX converter
-│   ├── image_processor.py   # Image preprocessing
-│   ├── tokenizer.py         # Text tokenization
-│   ├── mlx_model/           # Converted model weights (generated)
-│   └── LICENSE              # MIT License (Apple Inc.)
+├── core.py              # Shared utilities: EmbedImages UDF, load_model, embed_text/images
+├── embed.py             # CLI: sync embeddings from local dir and/or Google Drive
+├── drive.py             # Google Drive helpers: OAuth2, list/download files
+├── mcp_server.py        # MCP server entry point (background model load + refresh)
+├── server.py            # FastAPI server for local REST API
+├── search.py            # CLI search client (queries server.py)
 ├── data/
-│   └── pokemon/             # Pokemon artwork (1025 images)
-├── embeddings.lance/        # Lance DB storage (generated)
-├── mcp_server.py            # MCP server entry point
-├── server.py                # FastAPI server for local API
-├── search.py                # CLI search tool
-├── core.py                  # Shared utilities (EmbedImages, find_images, etc.)
-├── embed.py                 # CLI tool to sync embeddings from a directory
-├── test_embed.py            # Tests for embed.py
-├── simple_image_search.py   # Basic in-memory search demo
-├── daft_image_search.py     # Daft-based batch processing demo
-├── benchmark.py             # Benchmark script
-├── plot_benchmark.py        # Generate benchmark plot
-├── benchmark_results.csv    # Raw benchmark data (10 runs)
-├── benchmark_plot.png       # Benchmark visualization
-├── pyproject.toml           # Project dependencies
-└── uv.lock                  # Dependency lockfile
+│   └── pokemon/         # Pokemon artwork (1025 images, for testing)
+├── embeddings.lance/    # Lance DB — embeddings + metadata (generated, gitignored)
+├── pyproject.toml       # Project dependencies
+└── uv.lock              # Dependency lockfile
 ```
-
-## Benchmarks
-
-Embedding time for the Pokemon dataset (1025 images) on M4 Max, averaged over 10 runs.
-
-![Benchmark Results](benchmark_plot.png)
-
-Run benchmarks yourself:
-```bash
-uv run python benchmark.py      # Run one iteration, appends to CSV
-uv run python benchmark.py 100  # Benchmark with specific number of images
-uv run python plot_benchmark.py # Generate plot from CSV
-```
-
-### Real-world performance (M4 Max, home directory)
-
-| Metric | Value |
-|--------|-------|
-| Images found | 11,843 |
-| Scan time | ~26s |
-| Embed time | ~39s |
-| Total time | ~65s |
-| Embed speed | 260 img/s |
-| Re-run (cached) | ~31s (scan only) |
 
 ## Data Attribution
 
 ### Pokemon Artwork
 - **Source**: [PokeAPI/sprites](https://github.com/PokeAPI/sprites)
-- **License**: Repository is CC0 1.0 Universal
+- **License**: CC0 1.0 Universal
 - **Copyright**: All Pokemon images are Copyright The Pokemon Company
-
-### CLIP Implementation
-- **Source**: [ml-explore/mlx-examples](https://github.com/ml-explore/mlx-examples)
-- **License**: MIT License (Apple Inc.)
