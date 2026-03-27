@@ -18,6 +18,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+drive = [
+    "google-auth>=2.0.0",
+    "google-auth-oauthlib>=1.0.0",
+    "google-api-python-client>=2.0.0",
+]
 dev = [
     "fastapi>=0.128.0",
     "matplotlib>=3.10.8",
@@ -28,4 +33,4 @@ dev = [
 local-image-search = "mcp_server:main"
 
 [tool.setuptools]
-py-modules = ["mcp_server", "core", "embed"]
+py-modules = ["mcp_server", "core", "embed", "drive"]
