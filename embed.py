@@ -3,9 +3,11 @@
 
 import argparse
 import sys
+import threading
 import time
 import unicodedata
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
 
@@ -24,6 +26,15 @@ VECTOR_DTYPE = DataType.embedding(DataType.float32(), EMBED_DIM)
 
 # Batch size for Drive image embedding
 DRIVE_BATCH_SIZE = 16
+
+# Parallel download workers for Drive
+DRIVE_DOWNLOAD_WORKERS = 4
+
+# SigLIP input resolution — resize on download to save memory
+SIGLIP_INPUT_SIZE = 384
+
+# Thread-local storage for Drive service instances (googleapiclient is not thread-safe)
+_thread_local = threading.local()
 
 
 def get_current_files(directory: Path, recursive: bool = True, show_progress: bool = True, exclude_dirs: list[str] | None = None) -> dict[str, float]:
@@ -195,9 +206,8 @@ def sync_embeddings(directory: Path, recursive: bool = True, log_fn=print, exclu
 def sync_drive_embeddings(folder_url_or_id: str, log_fn=print) -> dict:
     """Index images directly from a Google Drive folder.
 
-    Downloads each image to memory (no local storage needed), embeds it
-    using CLIP, and stores the result in the Lance DB alongside any
-    locally-indexed images.
+    Downloads images in parallel (DRIVE_DOWNLOAD_WORKERS threads), resizes
+    to SigLIP input resolution in-memory, then embeds in batches.
 
     Args:
         folder_url_or_id: Google Drive folder URL or bare folder ID
@@ -207,12 +217,11 @@ def sync_drive_embeddings(folder_url_or_id: str, log_fn=print) -> dict:
         Dict with stats: {new, skipped, failed, total, elapsed}
     """
     from googleapiclient.http import MediaIoBaseDownload
-    from drive import extract_folder_id, get_service, list_folder_files_with_ids
+    from drive import extract_folder_id, list_folder_files_with_ids
 
     folder_id = extract_folder_id(folder_url_or_id)
     log_fn(f"Fetching file list from Drive folder {folder_id}...")
 
-    service = get_service()
     all_files = list_folder_files_with_ids(folder_id)
     image_files = [
         f for f in all_files
@@ -229,20 +238,70 @@ def sync_drive_embeddings(folder_url_or_id: str, log_fn=print) -> dict:
         if existing_drive_paths:
             log_fn(f"  {len(existing_drive_paths)} Drive image(s) already indexed — skipping")
 
-    # Load SigLIP model for embedding
+    to_download = [f for f in image_files if f"drive://{f['id']}" not in existing_drive_paths]
+    if not to_download:
+        log_fn("Nothing new to index.")
+        return {"new": 0, "skipped": len(existing_drive_paths), "failed": 0, "total": len(image_files), "elapsed": 0}
+
+    log_fn(f"Downloading {len(to_download)} image(s) with {DRIVE_DOWNLOAD_WORKERS} workers...")
+
+    def _get_thread_service():
+        """Return a per-thread Drive service (googleapiclient is not thread-safe)."""
+        if not hasattr(_thread_local, "drive_service"):
+            _thread_local.drive_service = get_service()
+        return _thread_local.drive_service
+
+    def _download(file_info: dict) -> tuple[dict, Image.Image | None, str | None]:
+        """Download and resize one Drive image. Returns (file_info, image, error)."""
+        file_id = file_info["id"]
+        name = file_info["name"]
+        try:
+            svc = _get_thread_service()
+            buf = BytesIO()
+            downloader = MediaIoBaseDownload(buf, svc.files().get_media(fileId=file_id))
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            buf.seek(0)
+            img = Image.open(buf).convert("RGB")
+            # Resize to SigLIP input size to cut memory and speed up embedding
+            img = img.resize((SIGLIP_INPUT_SIZE, SIGLIP_INPUT_SIZE), Image.LANCZOS)
+            return file_info, img, None
+        except Exception as e:
+            return file_info, None, str(e)
+
+    # Download in parallel, preserve order via index
+    downloaded: list[tuple[dict, Image.Image | None, str | None]] = [None] * len(to_download)
+    index_map = {f["id"]: i for i, f in enumerate(to_download)}
+    completed_count = 0
+    failed = 0
+
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=DRIVE_DOWNLOAD_WORKERS) as executor:
+        futures = {executor.submit(_download, f): f for f in to_download}
+        for future in as_completed(futures):
+            file_info, img, err = future.result()
+            idx = index_map[file_info["id"]]
+            downloaded[idx] = (file_info, img, err)
+            completed_count += 1
+            if err:
+                failed += 1
+                log_fn(f"  WARNING: could not download {file_info['name']}: {err}")
+            else:
+                log_fn(f"  [{completed_count}/{len(to_download)}] {file_info['name']}")
+
+    t_download = time.perf_counter() - t0
+    log_fn(f"Download done in {format_time(t_download)} ({len(to_download) - failed} ok, {failed} failed)")
+
+    # Load SigLIP model and embed in batches
     log_fn("Loading SigLIP model...")
     model, processor, device = load_model()
 
     new_rows: list[dict] = []
-    failed = 0
-    t0 = time.perf_counter()
-
-    # Process in batches to keep memory usage manageable
     batch_images: list[Image.Image] = []
     batch_meta: list[dict] = []
 
     def flush_batch():
-        nonlocal new_rows
         if not batch_images:
             return
         try:
@@ -255,48 +314,24 @@ def sync_drive_embeddings(folder_url_or_id: str, log_fn=print) -> dict:
         batch_images.clear()
         batch_meta.clear()
 
-    for i, file_info in enumerate(image_files):
+    log_fn(f"Embedding {len(to_download) - failed} image(s)...")
+    for file_info, img, err in downloaded:
+        if err or img is None:
+            continue
         file_id = file_info["id"]
-        name = file_info["name"]
-        drive_path = f"drive://{file_id}"
-
-        if drive_path in existing_drive_paths:
-            continue
-
-        # Normalize filename (Drive uses NFC, local filesystems may differ)
-        name_nfc = unicodedata.normalize("NFC", name)
-        drive_url = file_info.get(
-            "webViewLink", f"https://drive.google.com/file/d/{file_id}/view"
-        )
-
-        # Download image to memory
-        try:
-            request = service.files().get_media(fileId=file_id)
-            buf = BytesIO()
-            downloader = MediaIoBaseDownload(buf, request)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-            buf.seek(0)
-            image = Image.open(buf).convert("RGB")
-        except Exception as e:
-            log_fn(f"  WARNING: could not download {name}: {e}")
-            failed += 1
-            continue
-
-        batch_images.append(image)
+        name_nfc = unicodedata.normalize("NFC", file_info["name"])
+        drive_url = file_info.get("webViewLink", f"https://drive.google.com/file/d/{file_id}/view")
+        batch_images.append(img)
         batch_meta.append({
-            "path": drive_path,
+            "path": f"drive://{file_id}",
             "filename": name_nfc,
             "mtime": 0.0,
             "drive_url": drive_url,
         })
-        log_fn(f"  [{i + 1}/{len(image_files)}] {name}")
-
         if len(batch_images) >= DRIVE_BATCH_SIZE:
             flush_batch()
 
-    flush_batch()  # process remaining images
+    flush_batch()
 
     if not new_rows:
         log_fn("Nothing new to index.")
