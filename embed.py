@@ -4,15 +4,21 @@
 import argparse
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import daft
+import numpy as np
 from daft import col, DataType
+from PIL import Image
 
-from core import EmbedImages, find_images, format_time, IMAGES_PER_SECOND, DB_PATH
+warnings.filterwarnings("ignore", category=Image.DecompressionBombWarning)
+Image.MAX_IMAGE_PIXELS = None  # allow very large images
+
+from core import EMBED_DIM, EmbedImages, find_images, format_time, IMAGES_PER_SECOND, DB_PATH
 
 # Type for vector column
-VECTOR_DTYPE = DataType.embedding(DataType.float32(), 512)
+VECTOR_DTYPE = DataType.embedding(DataType.float32(), EMBED_DIM)
 
 
 def get_current_files(directory: Path, recursive: bool = True, show_progress: bool = True, exclude_dirs: list[str] | None = None) -> dict[str, float]:
@@ -110,10 +116,9 @@ def sync_embeddings(directory: Path, recursive: bool = True, log_fn=print, exclu
         else:
             df_final = df_new
     else:
-        # No new embeddings, just filter out deleted
+        # No new embeddings, just filter out deleted files
         df_existing = daft.read_lance(DB_PATH)
-        keep_list = list(current_paths)
-        df_final = df_existing.where(col("path").is_in(keep_list))
+        df_final = df_existing.where(col("path").is_in(list(current_paths)))
 
     # Write to Lance
     mode = "create" if not Path(DB_PATH).exists() else "overwrite"
@@ -138,13 +143,11 @@ def sync_embeddings(directory: Path, recursive: bool = True, log_fn=print, exclu
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Sync image embeddings from a directory"
+        description="Sync image embeddings from a local directory"
     )
     parser.add_argument(
         "directory",
-        nargs="?",
-        default=".",
-        help="Directory to search for images (default: current directory)",
+        help="Local directory to search for images",
     )
     parser.add_argument(
         "--dry-run",
@@ -170,7 +173,6 @@ def main():
         sys.exit(1)
 
     if args.dry_run:
-        # Just show stats without syncing
         current = get_current_files(directory, recursive=not args.no_recursive)
         stored = get_stored_files()
 
@@ -192,9 +194,8 @@ def main():
         if to_embed:
             estimated = len(to_embed) / IMAGES_PER_SECOND
             print(f"\nTo embed: {len(to_embed):,} images (~{format_time(estimated)})")
-        return
-
-    sync_embeddings(directory, recursive=not args.no_recursive)
+    else:
+        sync_embeddings(directory, recursive=not args.no_recursive)
 
 
 if __name__ == "__main__":

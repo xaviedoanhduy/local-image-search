@@ -13,7 +13,8 @@ app = FastAPI(title="Local Image Search")
 
 # Global state - loaded on startup
 model = None
-tokenizer = None
+processor = None
+device = None
 embeddings_df = None
 
 
@@ -24,6 +25,7 @@ class SearchRequest(BaseModel):
 
 class SearchResult(BaseModel):
     path: str
+    filename: str
     score: float
 
 
@@ -35,10 +37,10 @@ class SearchResponse(BaseModel):
 @app.on_event("startup")
 async def startup():
     """Load model and embeddings on startup."""
-    global model, tokenizer, embeddings_df
+    global model, processor, device, embeddings_df
 
-    print("Loading CLIP model...")
-    model, tokenizer, _ = load_model()
+    print("Loading SigLIP model...")
+    model, processor, device = load_model()
 
     print("Loading embeddings...")
     if Path(DB_PATH).exists():
@@ -62,7 +64,7 @@ async def search(request: SearchRequest):
         return SearchResponse(results=[], total_images=0)
 
     # Embed the query text
-    query_embedding = embed_text(model, tokenizer, request.query)
+    query_embedding = embed_text(request.query, model, processor, device)
 
     # Get all embeddings and paths
     data = embeddings_df.to_pydict()
@@ -71,7 +73,7 @@ async def search(request: SearchRequest):
 
     # Compute similarities
     scores = []
-    for i, vec in enumerate(vectors):
+    for vec in vectors:
         vec_array = np.array(vec, dtype=np.float32)
         # Skip zero vectors (failed images)
         if np.allclose(vec_array, 0):
@@ -84,7 +86,7 @@ async def search(request: SearchRequest):
 
     # Return top results
     results = [
-        SearchResult(path=path, score=score)
+        SearchResult(path=path, filename=Path(path).name, score=score)
         for path, score in ranked[:request.limit]
         if score > 0  # exclude failed images
     ]
