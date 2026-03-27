@@ -174,7 +174,7 @@ def embedding_refresh_loop():
         try:
             if image_dir and image_dir.exists():
                 log(f"Starting embedding refresh for {image_dir}...")
-                sync_embeddings(image_dir, log_fn=log, exclude_dirs=exclude_dirs)
+                sync_embeddings(image_dir, log_fn=log, exclude_dirs=exclude_dirs, model=model, processor=processor, device=device)
                 reload_embeddings()
             else:
                 log(f"Image directory not set or doesn't exist: {image_dir}")

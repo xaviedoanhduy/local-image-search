@@ -65,10 +65,15 @@ DEFAULT_EXCLUDE_DIRS = [
 class EmbedImages:
     """Daft UDF to generate SigLIP embeddings for images."""
 
-    def __init__(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = AutoModel.from_pretrained(MODEL_NAME).to(self.device).eval()
-        self.processor = AutoProcessor.from_pretrained(MODEL_NAME)
+    def __init__(self, model=None, processor=None, device=None):
+        if model is not None:
+            self.model = model
+            self.processor = processor
+            self.device = device
+        else:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.model = AutoModel.from_pretrained(MODEL_NAME).to(self.device).eval()
+            self.processor = AutoProcessor.from_pretrained(MODEL_NAME)
 
     @daft.method.batch(return_dtype=DataType.embedding(DataType.float32(), EMBED_DIM))
     def __call__(self, paths: Series):

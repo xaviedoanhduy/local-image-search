@@ -73,7 +73,7 @@ def _ensure_filename_column(df) -> "daft.DataFrame":
     return df.with_column("filename", col("filename").cast(DataType.string()))
 
 
-def sync_embeddings(directory: Path, recursive: bool = True, log_fn=print, exclude_dirs: list[str] | None = None) -> dict:
+def sync_embeddings(directory: Path, recursive: bool = True, log_fn=print, exclude_dirs: list[str] | None = None, model=None, processor=None, device=None) -> dict:
     """Sync embeddings for images in a directory.
 
     Args:
@@ -126,21 +126,54 @@ def sync_embeddings(directory: Path, recursive: bool = True, log_fn=print, exclu
     if to_embed:
         log_fn(f"Embedding {len(to_embed):,} images...")
 
-        # Prepare data for new embeddings (drive_url is null for local files)
         paths_to_embed = sorted(to_embed)
         mtimes_to_embed = [current[p] for p in paths_to_embed]
 
-        # Create DataFrame and embed
-        df_new = daft.from_pydict({
-            "path": paths_to_embed,
-            "mtime": mtimes_to_embed,
-            "drive_url": [None] * len(paths_to_embed),
-            "filename": [Path(p).name for p in paths_to_embed],
-        })
-        # Ensure drive_url is Utf8, not Null, so schemas match
-        df_new = df_new.with_column("drive_url", col("drive_url").cast(DataType.string()))
-        embed_images = EmbedImages()
-        df_new = df_new.with_column("vector", embed_images(col("path")))
+        if model is not None:
+            # Model already loaded — embed directly to avoid Daft serializing the
+            # 800MB PyTorch model into a second RAM copy via @daft.cls.
+            BATCH_SIZE = 32
+            vectors = []
+            for i in range(0, len(paths_to_embed), BATCH_SIZE):
+                batch_paths = paths_to_embed[i:i + BATCH_SIZE]
+                batch_images = []
+                failed_indices = []
+                for j, p in enumerate(batch_paths):
+                    try:
+                        batch_images.append(Image.open(p).convert("RGB"))
+                    except Exception as e:
+                        log_fn(f"Warning: Failed to load {p}: {e}")
+                        batch_images.append(Image.new("RGB", (224, 224)))
+                        failed_indices.append(j)
+                try:
+                    embs = embed_images_batch(batch_images, model, processor, device)
+                except Exception as e:
+                    log_fn(f"Warning: batch embed failed: {e}")
+                    embs = [np.zeros(EMBED_DIM, dtype=np.float32)] * len(batch_paths)
+                for j in failed_indices:
+                    embs[j] = np.zeros(EMBED_DIM, dtype=np.float32)
+                vectors.extend([e.tolist() for e in embs])
+
+            df_new = daft.from_pydict({
+                "path": paths_to_embed,
+                "mtime": mtimes_to_embed,
+                "drive_url": [None] * len(paths_to_embed),
+                "filename": [Path(p).name for p in paths_to_embed],
+                "vector": vectors,
+            })
+            df_new = df_new.with_column("drive_url", col("drive_url").cast(DataType.string()))
+            df_new = df_new.with_column("vector", col("vector").cast(VECTOR_DTYPE))
+        else:
+            # CLI path — no pre-loaded model; use Daft UDF (loads model once per actor).
+            df_new = daft.from_pydict({
+                "path": paths_to_embed,
+                "mtime": mtimes_to_embed,
+                "drive_url": [None] * len(paths_to_embed),
+                "filename": [Path(p).name for p in paths_to_embed],
+            })
+            df_new = df_new.with_column("drive_url", col("drive_url").cast(DataType.string()))
+            embed_images = EmbedImages()
+            df_new = df_new.with_column("vector", embed_images(col("path")))
 
         # If we have unchanged embeddings, combine them
         if unchanged_paths:
@@ -203,7 +236,7 @@ def sync_embeddings(directory: Path, recursive: bool = True, log_fn=print, exclu
     }
 
 
-def sync_drive_embeddings(folder_url_or_id: str, log_fn=print) -> dict:
+def sync_drive_embeddings(folder_url_or_id: str, log_fn=print, model=None, processor=None, device=None) -> dict:
     """Index images directly from a Google Drive folder.
 
     Downloads images in parallel (DRIVE_DOWNLOAD_WORKERS threads), resizes
@@ -217,7 +250,7 @@ def sync_drive_embeddings(folder_url_or_id: str, log_fn=print) -> dict:
         Dict with stats: {new, skipped, failed, total, elapsed}
     """
     from googleapiclient.http import MediaIoBaseDownload
-    from drive import extract_folder_id, list_folder_files_with_ids
+    from drive import extract_folder_id, get_service, list_folder_files_with_ids
 
     folder_id = extract_folder_id(folder_url_or_id)
     log_fn(f"Fetching file list from Drive folder {folder_id}...")
@@ -293,9 +326,10 @@ def sync_drive_embeddings(folder_url_or_id: str, log_fn=print) -> dict:
     t_download = time.perf_counter() - t0
     log_fn(f"Download done in {format_time(t_download)} ({len(to_download) - failed} ok, {failed} failed)")
 
-    # Load SigLIP model and embed in batches
-    log_fn("Loading SigLIP model...")
-    model, processor, device = load_model()
+    # Load SigLIP model and embed in batches (reuse caller's model if provided)
+    if model is None:
+        log_fn("Loading SigLIP model...")
+        model, processor, device = load_model()
 
     new_rows: list[dict] = []
     batch_images: list[Image.Image] = []
