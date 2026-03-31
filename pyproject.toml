@@ -1,20 +1,20 @@
 [project]
 name = "local-image-search"
-version = "0.2.4"
-description = "MCP server for local image search using CLIP embeddings"
+version = "0.3.0"
+description = "MCP server for local image search using SigLIP embeddings"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "daft>=0.7.2",
     "huggingface-hub>=0.36.0",
     "mcp>=1.0.0",
-    "mlx>=0.30.3",
-    "numpy>=2.4.1",
-    "pillow>=12.1.0",
-    "pillow-heif>=1.1.1",
-    "pylance>=1.0.2",
-    "regex>=2024.0.0",
-    "torch>=2.9.1",
+    "numpy>=2.2.0",
+    "pillow>=10.0.0",
+    "pillow-heif>=0.18.0",
+    "sentencepiece>=0.1.99",
+    "protobuf>=3.20.0",
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
 ]
 
 [project.optional-dependencies]
@@ -29,4 +29,3 @@ local-image-search = "mcp_server:main"
 
 [tool.setuptools]
 py-modules = ["mcp_server", "core", "embed"]
-packages = ["clip"]

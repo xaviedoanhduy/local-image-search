@@ -2,6 +2,7 @@
 """CLI tool to sync image embeddings from a directory."""
 
 import argparse
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -9,10 +10,10 @@ from pathlib import Path
 import daft
 from daft import col, DataType
 
-from core import EmbedImages, find_images, format_time, IMAGES_PER_SECOND, DB_PATH
+from core import EMBED_DIM, EmbedImages, find_images, format_time, IMAGES_PER_SECOND, DB_PATH
 
 # Type for vector column
-VECTOR_DTYPE = DataType.embedding(DataType.float32(), 512)
+VECTOR_DTYPE = DataType.embedding(DataType.float32(), EMBED_DIM)
 
 
 def get_current_files(directory: Path, recursive: bool = True, show_progress: bool = True, exclude_dirs: list[str] | None = None) -> dict[str, float]:
@@ -30,6 +31,15 @@ def get_stored_files() -> dict[str, float]:
     results = df.select("path", "mtime").collect()
     data = results.to_pydict()
     return dict(zip(data["path"], data["mtime"]))
+
+
+def _ensure_filename_column(df) -> "daft.DataFrame":
+    """Ensure filename column exists (backward compatibility)."""
+    try:
+        df.schema()["filename"]
+    except KeyError:
+        df = df.with_column("filename", daft.lit(None).cast(DataType.string()))
+    return df.with_column("filename", col("filename").cast(DataType.string()))
 
 
 def sync_embeddings(directory: Path, recursive: bool = True, log_fn=print, exclude_dirs: list[str] | None = None) -> dict:
@@ -89,7 +99,11 @@ def sync_embeddings(directory: Path, recursive: bool = True, log_fn=print, exclu
         mtimes_to_embed = [current[p] for p in paths_to_embed]
 
         # Create DataFrame and embed
-        df_new = daft.from_pydict({"path": paths_to_embed, "mtime": mtimes_to_embed})
+        df_new = daft.from_pydict({
+            "path": paths_to_embed,
+            "mtime": mtimes_to_embed,
+            "filename": [Path(p).name for p in paths_to_embed],
+        })
         embed_images = EmbedImages()
         df_new = df_new.with_column("vector", embed_images(col("path")))
 
@@ -105,6 +119,9 @@ def sync_embeddings(directory: Path, recursive: bool = True, log_fn=print, exclu
                 "vector", col("vector").cast(VECTOR_DTYPE)
             )
 
+            # Ensure filename column exists for backward compatibility
+            df_unchanged = _ensure_filename_column(df_unchanged)
+
             # Combine unchanged + new
             df_final = df_unchanged.concat(df_new)
         else:
@@ -114,10 +131,13 @@ def sync_embeddings(directory: Path, recursive: bool = True, log_fn=print, exclu
         df_existing = daft.read_lance(DB_PATH)
         keep_list = list(current_paths)
         df_final = df_existing.where(col("path").is_in(keep_list))
+        df_final = df_final.with_column("vector", col("vector").cast(VECTOR_DTYPE))
+        df_final = _ensure_filename_column(df_final)
 
-    # Write to Lance
-    mode = "create" if not Path(DB_PATH).exists() else "overwrite"
-    df_final.write_lance(DB_PATH, mode=mode)
+    # Write to Lance — delete first if it exists so schema changes don't cause conflicts
+    if Path(DB_PATH).exists():
+        shutil.rmtree(DB_PATH)
+    df_final.write_lance(DB_PATH, mode="create")
 
     elapsed = time.perf_counter() - start
 

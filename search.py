@@ -34,7 +34,8 @@ def main():
 
     print(f"Found {data['total_images']} images, showing top {len(results)}:\n")
     for i, r in enumerate(results, 1):
-        print(f"{i}. [{r['score']:.3f}] {r['path']}")
+        filename = r.get("filename") or r["path"].split("/")[-1]
+        print(f"{i}. [{r['score']:.3f}] {filename}  —  {r['path']}")
 
 
 if __name__ == "__main__":
