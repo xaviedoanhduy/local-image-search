@@ -2,9 +2,10 @@
 """MCP server for local image search."""
 
 import fcntl
+import gc
+import math
 import os
 import random
-import subprocess
 import sys
 import threading
 import time
@@ -14,11 +15,17 @@ import daft
 import numpy as np
 from mcp.server.fastmcp import FastMCP
 
-from core import load_model, embed_text, cosine_similarity, DB_PATH, MODEL_PATH, DEFAULT_EXCLUDE_DIRS
+from core import load_model, embed_text, cosine_similarity, DB_PATH, DEFAULT_EXCLUDE_DIRS
 from embed import sync_embeddings
 
 # File-based lock to prevent concurrent refreshes across processes
 LOCK_FILE = Path(DB_PATH).parent / ".embedding_refresh.lock"
+
+# How long (seconds) to keep model in RAM after last use before unloading
+MODEL_IDLE_TIMEOUT = int(os.environ.get("MODEL_IDLE_TIMEOUT", "300"))  # default 5 minutes
+
+# Delay before first embedding refresh (seconds) — avoids CPU spike at Claude startup
+REFRESH_STARTUP_DELAY = int(os.environ.get("REFRESH_STARTUP_DELAY", "120"))  # default 2 minutes
 
 
 def log(msg: str):
@@ -29,42 +36,71 @@ def log(msg: str):
 # Create MCP server
 mcp = FastMCP("local-image-search")
 
-# Global state - loaded on startup
+# Global state
 model = None
-tokenizer = None
+processor = None
+device = None
 embeddings_df = None
 image_dir = None
-exclude_dirs = None  # Directories to exclude from scanning
-model_loading = False  # True while model is being downloaded/loaded
+exclude_dirs = None
+model_lock = threading.Lock()       # Protects model load/unload
+model_last_used = 0.0               # Timestamp of last search_images call
 
 # Embedding refresh state
 REFRESH_INTERVAL = int(os.environ.get("REFRESH_INTERVAL", "60"))  # default 1 minute
 
 
+def _load_model_if_needed():
+    """Load model lazily. Must be called with model_lock held."""
+    global model, processor, device
+    if model is not None:
+        return
+    log("Loading SigLIP model (downloads on first run, ~800MB)...")
+    model, processor, device = load_model()
+    log(f"Model loaded on {device}")
+
+
+def _unload_model():
+    """Unload model and free RAM. Must be called with model_lock held."""
+    global model, processor, device
+    if model is None:
+        return
+    del model, processor
+    model = processor = device = None
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    log("Model unloaded (idle timeout reached)")
+
+
+def model_idle_watcher():
+    """Background thread: unload model after MODEL_IDLE_TIMEOUT seconds of inactivity."""
+    while True:
+        time.sleep(30)  # check every 30s
+        with model_lock:
+            if model is not None and model_last_used > 0:
+                idle = time.monotonic() - model_last_used
+                if idle >= MODEL_IDLE_TIMEOUT:
+                    _unload_model()
+
+
 def get_status_info() -> dict:
     """Get current service status."""
-    if model_loading:
-        return {
-            "ready": False,
-            "status": "downloading_model",
-            "message": "Model is downloading (~600MB). Please wait 1-2 minutes."
-        }
-    if model is None:
-        return {
-            "ready": False,
-            "status": "loading_model",
-            "message": "Model is loading. Please wait a moment."
-        }
     if embeddings_df is None or len(embeddings_df) == 0:
         return {
             "ready": False,
-            "status": "syncing_embeddings",
-            "message": "Initial embedding sync in progress. This may take a few minutes depending on the number of images."
+            "status": "no_embeddings",
+            "message": "No embeddings found. Run: uv run python embed.py --drive-folder <url>"
         }
+    model_status = "loaded" if model is not None else "unloaded (will load on first search)"
     return {
         "ready": True,
         "status": "ready",
-        "total_images": len(embeddings_df)
+        "total_images": len(embeddings_df),
+        "model": model_status,
     }
 
 
@@ -79,91 +115,116 @@ def get_status() -> dict:
 
 
 @mcp.tool()
-def search_images(query: str, limit: int = 5) -> list[dict]:
+def search_images(
+    query: str,
+    limit: int = 5,
+    sort_by: str = "relevance",
+    quality_weight: float = 0.5,
+    min_relevance: float = 0.0,
+) -> list[dict]:
     """Search for images matching a text query.
 
     Args:
         query: Natural language description of the image to find
         limit: Maximum number of results to return (default: 5)
+        sort_by: How to rank results — "relevance" (default), "quality", or "combined"
+            - "relevance": rank by SigLIP cosine similarity to query (standard semantic search)
+            - "quality": filter by min_relevance, then rank by aesthetic score
+            - "combined": weighted blend of relevance and aesthetic score
+        quality_weight: Weight for aesthetic score when sort_by="combined" (0.0–1.0, default 0.5)
+        min_relevance: Minimum relevance score to include a result (default 0.0).
+            Useful with sort_by="quality" to filter out off-topic images before ranking by quality.
+            Recommended: 0.05–0.10 for quality/combined modes.
 
     Returns:
-        List of matching images with paths and similarity scores
+        List of matching images with paths, similarity scores, and aesthetic scores
     """
-    global model, tokenizer, embeddings_df
+    global model, processor, device, embeddings_df, model_last_used
 
-    # Check if service is ready
+    # Check if embeddings are available
     status = get_status_info()
     if not status["ready"]:
         return [status]
 
-    # Embed the query text
-    query_embedding = embed_text(model, tokenizer, query)
+    # Lazy-load model on first use (or after idle unload)
+    with model_lock:
+        _load_model_if_needed()
+        model_last_used = time.monotonic()
+        # Embed inside the lock so model isn't unloaded mid-search
+        query_embedding = embed_text(query, model, processor, device)
 
     # Get all embeddings and paths
     data = embeddings_df.to_pydict()
     paths = data["path"]
     vectors = data["vector"]
+    drive_urls = data.get("drive_url", [None] * len(paths))
+    filenames = data.get("filename", [None] * len(paths))
+    aesthetic_scores = data.get("aesthetic_score", [None] * len(paths))
 
-    # Compute similarities
-    scores = []
-    for i, vec in enumerate(vectors):
+    # Compute relevance similarities
+    relevance_scores = []
+    for vec in vectors:
         vec_array = np.array(vec, dtype=np.float32)
-        # Skip zero vectors (failed images)
         if np.allclose(vec_array, 0):
-            scores.append(-1.0)
+            relevance_scores.append(-1.0)
         else:
-            scores.append(cosine_similarity(query_embedding, vec_array))
+            relevance_scores.append(cosine_similarity(query_embedding, vec_array))
 
-    # Sort by score descending
-    ranked = sorted(zip(paths, scores), key=lambda x: x[1], reverse=True)
+    # Compute final ranking score based on sort_by
+    def _aesthetic(v):
+        """Normalize aesthetic score: None/NaN → 0.5 (neutral)."""
+        try:
+            f = float(v)
+            return 0.5 if math.isnan(f) else f
+        except (TypeError, ValueError):
+            return 0.5
 
-    # Return top results
-    results = [
-        {"path": path, "score": round(score, 3)}
-        for path, score in ranked[:limit]
-        if score > 0  # exclude failed images
-    ]
+    if sort_by == "quality":
+        final_scores = [_aesthetic(a) for a in aesthetic_scores]
+    elif sort_by == "combined":
+        qw = max(0.0, min(1.0, quality_weight))
+        final_scores = [
+            (1.0 - qw) * r + qw * _aesthetic(a)
+            for r, a in zip(relevance_scores, aesthetic_scores)
+        ]
+    else:  # "relevance" (default)
+        final_scores = relevance_scores
+
+    # Sort by final score descending
+    ranked = sorted(
+        zip(paths, final_scores, relevance_scores, drive_urls, filenames, aesthetic_scores),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    # Deduplicate by path (same Drive file_id may appear in multiple folders)
+    # ranked is already sorted by score desc, so first occurrence = highest score
+    seen_paths: set[str] = set()
+    results = []
+    for path, final_score, relevance, drive_url, filename, aesthetic in ranked:
+        if len(results) >= limit:
+            break
+        if relevance <= 0:  # always exclude corrupt/failed images (zero vector)
+            continue
+        if relevance < min_relevance:  # apply caller-specified relevance floor
+            continue
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        entry = {
+            "path": path,
+            "score": round(final_score, 3),
+            "relevance": round(relevance, 3),
+        }
+        if aesthetic is not None:  # only include if image has been scored
+            entry["aesthetic_score"] = round(_aesthetic(aesthetic), 3)
+        if drive_url and str(drive_url) not in ("None", "nan", ""):
+            entry["drive_url"] = drive_url
+        name = filename if filename and str(filename) not in ("None", "nan", "") else Path(path).name
+        entry["filename"] = name
+        results.append(entry)
 
     return results
-
-
-def ensure_model_exists():
-    """Download and convert CLIP model if not present."""
-    model_path = Path(MODEL_PATH)
-
-    # Check if model exists (look for model.safetensors or model.safetensors.index.json)
-    if (model_path / "model.safetensors").exists() or (model_path / "model.safetensors.index.json").exists():
-        return True
-
-    log("Model not found. Downloading and converting CLIP model (~600MB)...")
-    log("This only needs to happen once.")
-
-    # Run convert.py from the clip directory
-    clip_dir = model_path.parent
-    convert_script = clip_dir / "convert.py"
-
-    if not convert_script.exists():
-        log(f"Error: convert.py not found at {convert_script}")
-        return False
-
-    try:
-        result = subprocess.run(
-            [sys.executable, str(convert_script)],
-            cwd=str(clip_dir),
-            capture_output=True,
-            text=True
-        )
-
-        if result.returncode != 0:
-            log(f"Error downloading model: {result.stderr}")
-            return False
-
-        log("Model downloaded and converted successfully.")
-        return True
-
-    except Exception as e:
-        log(f"Error downloading model: {e}")
-        return False
 
 
 def reload_embeddings():
@@ -181,6 +242,10 @@ def reload_embeddings():
 def embedding_refresh_loop():
     """Background loop to refresh embeddings periodically."""
     global image_dir, exclude_dirs
+
+    # Wait before first refresh so Claude startup isn't competing with model load
+    log(f"Embedding refresh will start in {REFRESH_STARTUP_DELAY}s...")
+    time.sleep(REFRESH_STARTUP_DELAY)
 
     while True:
         # Add random jitter (0-30 seconds) to prevent thundering herd
@@ -217,33 +282,30 @@ def embedding_refresh_loop():
 
 
 def startup_task():
-    """Background task to download model and load embeddings."""
-    global model, tokenizer, embeddings_df, image_dir, model_loading
+    """Background task to load embeddings and start background threads.
 
-    model_loading = True
+    Model is NOT loaded here — it loads lazily on first search_images call.
+    This keeps startup fast and avoids RAM spike when Claude launches.
+    """
+    global embeddings_df, image_dir
 
-    # Ensure model exists (download if needed)
-    if not ensure_model_exists():
-        log("Failed to download model.")
-        model_loading = False
-        return
-
-    log("Loading CLIP model...")
-    model, tokenizer, _ = load_model()
-    model_loading = False
-
-    log("Loading embeddings...")
+    # Load embeddings index (Lance DB read is fast, no model needed)
+    log("Loading embeddings index...")
     if Path(DB_PATH).exists():
         embeddings_df = daft.read_lance(DB_PATH).collect()
-        log(f"Loaded {len(embeddings_df)} embeddings")
+        log(f"Loaded {len(embeddings_df)} embeddings (model will load on first search)")
     else:
-        log("No embeddings found.")
+        log("No embeddings found. Run: uv run python embed.py --drive-folder <url>")
 
-    # Start background embedding refresh thread
+    # Start model idle watcher
+    watcher_thread = threading.Thread(target=model_idle_watcher, daemon=True)
+    watcher_thread.start()
+
+    # Start background embedding refresh thread (with startup delay)
     if image_dir:
         refresh_thread = threading.Thread(target=embedding_refresh_loop, daemon=True)
         refresh_thread.start()
-        log(f"Background embedding refresh started (every {REFRESH_INTERVAL}s)")
+        log(f"Background embedding refresh scheduled (delay={REFRESH_STARTUP_DELAY}s, interval={REFRESH_INTERVAL}s)")
 
 
 def main():

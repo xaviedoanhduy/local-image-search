@@ -4,112 +4,43 @@ See README.md for project structure and setup instructions.
 
 ## What We've Done
 
-- Set up MLX CLIP from ml-explore/mlx-examples
+- Replaced MLX/CLIP with HuggingFace SigLIP (`google/siglip-so400m-patch14-384`) for cross-platform support (Linux, macOS, Windows)
 - Created Daft-based batch embedding with `@daft.cls`
 - Benchmarked performance (see benchmark_plot.png)
 - Added Pokemon dataset (1025 images) for testing
 - Implemented Lance DB storage for embeddings
-- Added FastAPI server and search CLI
+- Added FastAPI server, web UI, and search CLI
 - Added incremental embedding (skips unchanged files by path + mtime)
 - Added error handling for corrupted/unreadable images
+- Added Google Drive integration (OAuth2, download-to-memory, no local copy)
+- Drive folder traversal is **recursive** — all subfolders at any depth are indexed
+- Multi-folder Drive support — `drive_folder_id` column tracks which folder each image belongs to
+- Smart re-index: metadata-only backfill (~100ms) when only new columns need updating, no re-embed
+- Dedup search results by `path` (Drive file_id) — same file in multiple folders appears once
+- MCP server: lazy model load (only on first `search_images` call)
+- MCP server: idle unload — model freed after `MODEL_IDLE_TIMEOUT` seconds (default 5 min)
+- MCP server: startup refresh delayed by `REFRESH_STARTUP_DELAY` (default 2 min)
+- Aesthetic scoring with `cafeai/cafe_aesthetic` — 0–1 quality score per image, checkpoints every 500
+- `search_images` supports `sort_by`: relevance | quality | combined, with `min_relevance` floor
+- Web UI at `/` — image grid with lightbox, sort controls, Drive proxy thumbnails
+- Drive image proxy at `/image/<file_id>` — streams Drive images server-side, no user auth needed
 
-## MCP Server Plan
-
-Goal: Make this an MCP server users can install with a single command.
-
-### How MCP Configuration Works
-
-Claude Desktop/Code config (`claude_desktop_config.json` or `.claude.json`):
-```json
-{
-  "mcpServers": {
-    "local-image-search": {
-      "command": "uvx",
-      "args": ["local-image-search", "/Users/username/Pictures"],
-      "env": {
-        "REFRESH_INTERVAL": "60"
-      }
-    }
-  }
-}
-```
-
-- **command** - The executable to run (`uvx` for Python packages)
-- **args** - CLI arguments (first is package name, rest are passed to the server)
-- **env** - Environment variables (isolated from shell, must be explicit)
-
-### Implementation Plan
-
-1. ~~Add `mcp` SDK to dependencies~~ Done
-2. ~~Create MCP server that exposes `search_images` tool~~ Done
-3. ~~Add console script entry point in pyproject.toml~~ Done
-4. ~~Auto-download model if not present~~ Done
-5. ~~Background thread to refresh embeddings~~ Done
-   - Runs immediately on startup (initial sync)
-   - Default: every 60 seconds (configurable via `REFRESH_INTERVAL` env var)
-   - Separate thread so it doesn't block MCP requests
-6. ~~Take image directory as CLI argument~~ Done
-7. Users run: `uvx local-image-search ~/Pictures`
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `REFRESH_INTERVAL` | `60` | Seconds between embedding refresh cycles |
-| `EXCLUDE_DIRS` | (none) | Comma-separated list of directories to exclude |
-
-### Configuration Logic
-
-| Options | Root | Excludes |
-|---------|------|----------|
-| None | `~` (home) | Default excludes |
-| Root only | Custom root | None |
-| Excludes only | `~` (home) | Custom excludes |
-| Root + Excludes | Custom root | Custom excludes |
-
-**Default excludes:** Library, .Trash, .cache, Cache, node_modules, .git, .venv, venv
-
-### Example Configurations
-
-**Minimal (scan home with defaults):**
-```json
-{
-  "mcpServers": {
-    "local-image-search": {
-      "command": "uvx",
-      "args": ["local-image-search"]
-    }
-  }
-}
-```
-
-**Custom folder:**
-```json
-{
-  "args": ["local-image-search", "~/Pictures"]
-}
-```
-
-**Custom excludes:**
-```json
-{
-  "args": ["local-image-search"],
-  "env": {
-    "EXCLUDE_DIRS": "Downloads,Desktop,Movies"
-  }
-}
-```
-
-### MCP Server Setup (Development)
+## MCP Server Setup (Development)
 
 To test locally during development:
 
 ```bash
 # Add to Claude Code (must split command and args properly)
-claude mcp add -s user local-image-search -- uv --directory /Users/yk/Desktop/projects/local-image-search run python mcp_server.py
+claude mcp add -s user local-image-search -- uv --directory /path/to/local-image-search run python mcp_server.py
 
 # Restart Claude Code to load the server
 ```
+
+**Memory behaviour (important for low-RAM machines):**
+- Startup: only Lance DB is read (~50 MB). Model is NOT loaded.
+- First `search_images` call: model loads (~800 MB, ~5-10s delay).
+- After `MODEL_IDLE_TIMEOUT` seconds idle: model unloads automatically, RAM freed.
+- Embedding refresh starts `REFRESH_STARTUP_DELAY` seconds after launch (not immediately).
 
 **Gotchas we encountered:**
 
