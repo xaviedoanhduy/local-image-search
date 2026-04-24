@@ -58,8 +58,11 @@ async function doSearch() {
       const div = document.createElement('div');
       div.className = 'card';
       div.innerHTML = `
-        <img src="${r.file_id ? `/image/${r.file_id}?size=400` : ''}"
-             loading="lazy" alt="${escHtml(r.filename)}">
+        <div class="card-thumb">
+          <div class="card-thumb-spinner"><span class="spinner"></span></div>
+          <img src="${r.file_id ? `/image/${r.file_id}?size=400` : ''}"
+               loading="lazy" alt="${escHtml(r.filename)}">
+        </div>
         <div class="card-info">
           <div class="card-name" title="${escHtml(r.filename)}">${escHtml(r.filename)}</div>
           <div class="card-scores">
@@ -70,7 +73,9 @@ async function doSearch() {
         </div>`;
 
       const img = div.querySelector('img');
-      img.onerror = () => { img.style.background = 'var(--bg-input)'; };
+      const thumbSpinner = div.querySelector('.card-thumb-spinner');
+      img.onload = () => { thumbSpinner.style.display = 'none'; };
+      img.onerror = () => { thumbSpinner.style.display = 'none'; };
 
       // Attach click handler via JS (no inline onclick, no escaping issues)
       if (r.file_id) {
@@ -96,16 +101,19 @@ function openLb(fileId, driveUrl, name) {
   lb.classList.add('open');
   history.pushState({ lightbox: true }, '');
 
-  // Show thumbnail immediately (already in browser cache from the card grid)
-  lbImg.src = `/image/${fileId}?size=400`;
-  lbImg.style.display = 'block';
-  lbLoading.style.display = 'none';
+  lbImg.style.display = 'none';
+  lbLoading.style.display = 'flex';
   lbImg.alt = name || '';
 
-  // Load full-size in background, swap when ready
-  const full = new Image();
-  full.onload = () => { lbImg.src = full.src; };
-  full.src = `/image/${fileId}?size=1600`;
+  lbImg.onload = () => {
+    lbLoading.style.display = 'none';
+    lbImg.style.display = 'block';
+    // Load full-size in background, swap when ready
+    const full = new Image();
+    full.onload = () => { lbImg.src = full.src; };
+    full.src = `/image/${fileId}?size=1600`;
+  };
+  lbImg.src = `/image/${fileId}?size=400`;
 }
 
 function closeLb(popHistory = true) {
