@@ -41,7 +41,7 @@ model = None
 processor = None
 device = None
 embeddings_df = None
-_drive_service = None
+_drive_local = None  # threading.local() — one Drive service per thread
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -70,10 +70,13 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 def _drive_svc():
-    global _drive_service
-    if _drive_service is None:
-        _drive_service = get_service()
-    return _drive_service
+    import threading
+    global _drive_local
+    if _drive_local is None:
+        _drive_local = threading.local()
+    if not hasattr(_drive_local, "service"):
+        _drive_local.service = get_service()
+    return _drive_local.service
 
 
 class SearchRequest(BaseModel):
