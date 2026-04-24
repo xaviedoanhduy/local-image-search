@@ -189,7 +189,9 @@ async def search(request: SearchRequest):
 @app.get("/image/{file_id}")
 async def proxy_image(file_id: str, size: int = Query(default=800, le=1600)):
     """Proxy a Drive image — stream from Drive, resize, no local cache required."""
-    log.debug("Proxying image file_id=%s size=%d", file_id, size)
+    import time
+    t0 = time.monotonic()
+    log.info("drive proxy start file_id=%s size=%d", file_id, size)
     try:
         svc = _drive_svc()
         request_obj = svc.files().get_media(fileId=file_id)
@@ -198,6 +200,9 @@ async def proxy_image(file_id: str, size: int = Query(default=800, le=1600)):
         done = False
         while not done:
             _, done = dl.next_chunk()
+        t_download = time.monotonic() - t0
+        log.info("drive proxy download done file_id=%s download=%.2fs bytes=%d",
+                 file_id, t_download, buf.tell())
         buf.seek(0)
 
         img = Image.open(buf).convert("RGB")
@@ -206,11 +211,14 @@ async def proxy_image(file_id: str, size: int = Query(default=800, le=1600)):
         img.save(out, format="JPEG", quality=85)
         out.seek(0)
 
+        t_total = time.monotonic() - t0
+        log.info("drive proxy done file_id=%s total=%.2fs", file_id, t_total)
         return StreamingResponse(out, media_type="image/jpeg", headers={
             "Cache-Control": "public, max-age=3600",
         })
     except Exception as e:
-        log.warning("Failed to proxy image %s: %s", file_id, e)
+        log.warning("drive proxy failed file_id=%s elapsed=%.2fs error=%s",
+                    file_id, time.monotonic() - t0, e)
         raise HTTPException(status_code=404, detail=str(e))
 
 

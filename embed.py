@@ -73,7 +73,7 @@ def _ensure_drive_folder_id_column(df) -> "daft.DataFrame":
 
 
 # Canonical column order for all DataFrames written to the DB
-_CANONICAL_COLS = ["path", "mtime", "drive_url", "drive_folder_id", "filename", "vector", "aesthetic_score"]
+_CANONICAL_COLS = ["path", "mtime", "drive_url", "drive_folder_id", "filename", "vector", "aesthetic_score", "md5"]
 
 
 def _ensure_aesthetic_score_column(df) -> "daft.DataFrame":
@@ -85,12 +85,22 @@ def _ensure_aesthetic_score_column(df) -> "daft.DataFrame":
     return df.with_column("aesthetic_score", col("aesthetic_score").cast(DataType.float32()))
 
 
+def _ensure_md5_column(df) -> "daft.DataFrame":
+    """Ensure md5 column exists (backward compatibility)."""
+    try:
+        df.schema()["md5"]
+    except (KeyError, ValueError):
+        df = df.with_column("md5", daft.lit(None).cast(DataType.string()))
+    return df.with_column("md5", col("md5").cast(DataType.string()))
+
+
 def _normalize_schema(df) -> "daft.DataFrame":
     """Ensure optional columns exist and reorder to canonical schema."""
     df = _ensure_drive_url_column(df)
     df = _ensure_filename_column(df)
     df = _ensure_drive_folder_id_column(df)
     df = _ensure_aesthetic_score_column(df)
+    df = _ensure_md5_column(df)
     return df.select(*_CANONICAL_COLS)
 
 
@@ -263,16 +273,25 @@ def sync_drive_embeddings(folder_url_or_id: str, log_fn=print) -> dict:
     if Path(DB_PATH).exists():
         df_existing_check = daft.read_lance(DB_PATH)
         df_existing_check = _ensure_drive_folder_id_column(df_existing_check)
-        check_data = df_existing_check.select("path", "drive_folder_id").collect().to_pydict()
+        df_existing_check = _ensure_md5_column(df_existing_check)
+        check_data = df_existing_check.select("path", "drive_folder_id", "md5").collect().to_pydict()
         existing_folder_by_path: dict[str, str | None] = dict(
             zip(check_data["path"], check_data["drive_folder_id"])
         )
+        existing_md5s: set[str] = {m for m in check_data["md5"] if m}
     else:
         existing_folder_by_path = {}
+        existing_md5s = set()
 
+    skipped_duplicates = 0
     for file_info in image_files:
         drive_path = f"drive://{file_info['id']}"
+        md5 = file_info.get("md5Checksum")
         if drive_path not in existing_folder_by_path:
+            # Skip if same content (different file_id, same md5 — e.g. "Copy of X")
+            if md5 and md5 in existing_md5s:
+                skipped_duplicates += 1
+                continue
             needs_embed.append(file_info)
         elif existing_folder_by_path[drive_path] is None:
             needs_backfill.append(drive_path)
@@ -280,7 +299,8 @@ def sync_drive_embeddings(folder_url_or_id: str, log_fn=print) -> dict:
 
     log_fn(f"  To embed (new): {len(needs_embed)} | "
            f"Metadata backfill: {len(needs_backfill)} | "
-           f"Up-to-date: {len(image_files) - len(needs_embed) - len(needs_backfill)}")
+           f"Duplicate content skipped: {skipped_duplicates} | "
+           f"Up-to-date: {len(image_files) - len(needs_embed) - len(needs_backfill) - skipped_duplicates}")
 
     t0 = time.perf_counter()
     failed = 0
@@ -337,6 +357,7 @@ def sync_drive_embeddings(folder_url_or_id: str, log_fn=print) -> dict:
                 "mtime": 0.0,
                 "drive_url": drive_url,
                 "drive_folder_id": folder_id,
+                "md5": file_info.get("md5Checksum"),
             })
             log_fn(f"  [{i + 1}/{len(needs_embed)}] {name}")
 
@@ -602,6 +623,75 @@ def add_aesthetic_scores(log_fn=_flushing_print) -> dict:
     return {"scored": scored, "skipped": skipped, "failed": failed}
 
 
+def dedup_by_md5(log_fn=print):
+    """Fetch md5Checksum from Drive for all indexed Drive files, then remove duplicate-content entries."""
+    from drive import get_service
+
+    if not Path(DB_PATH).exists():
+        log_fn("No DB found.")
+        return
+
+    df = daft.read_lance(DB_PATH)
+    df = _normalize_schema(df)
+    data = df.collect().to_pydict()
+
+    drive_paths = [p for p in data["path"] if p.startswith("drive://")]
+    log_fn(f"Fetching md5Checksum for {len(drive_paths)} Drive entries...")
+
+    service = get_service()
+
+    # Batch fetch metadata — files.get per file_id
+    md5_by_path: dict[str, str] = {}
+    for i, path in enumerate(drive_paths):
+        file_id = path.removeprefix("drive://")
+        try:
+            meta = service.files().get(fileId=file_id, fields="id,md5Checksum").execute()
+            md5 = meta.get("md5Checksum")
+            if md5:
+                md5_by_path[path] = md5
+        except Exception as e:
+            log_fn(f"  WARNING: could not fetch md5 for {file_id}: {e}")
+        if (i + 1) % 500 == 0:
+            log_fn(f"  {i + 1}/{len(drive_paths)} fetched...")
+
+    log_fn(f"Got md5 for {len(md5_by_path)}/{len(drive_paths)} Drive files")
+
+    # Find duplicates: for each md5, keep the first occurrence (by index), drop the rest
+    seen_md5: dict[str, int] = {}  # md5 → index of kept row
+    duplicate_paths: set[str] = set()
+    for path, md5 in md5_by_path.items():
+        if md5 in seen_md5:
+            duplicate_paths.add(path)
+        else:
+            seen_md5[md5] = 1
+
+    if not duplicate_paths:
+        log_fn("No duplicates found.")
+        # Still write md5 values to DB
+    else:
+        log_fn(f"Found {len(duplicate_paths)} duplicate entries — removing...")
+
+    # Write md5 values into data and drop duplicate rows
+    new_data: dict[str, list] = {c: [] for c in _CANONICAL_COLS}
+    for i, path in enumerate(data["path"]):
+        if path in duplicate_paths:
+            continue
+        for col_name in _CANONICAL_COLS:
+            val = data[col_name][i]
+            if col_name == "md5" and path in md5_by_path:
+                val = md5_by_path[path]
+            new_data[col_name].append(val)
+
+    df_final = daft.from_pydict(new_data)
+    df_final = df_final.with_column("vector", col("vector").cast(VECTOR_DTYPE))
+    df_final = _normalize_schema(df_final)
+    df_final = df_final.collect()
+
+    shutil.rmtree(DB_PATH)
+    df_final.write_lance(DB_PATH, mode="create")
+    log_fn(f"Done — {len(new_data['path'])} entries remaining (removed {len(duplicate_paths)}).")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Sync image embeddings from a local directory and/or Google Drive"
@@ -631,11 +721,16 @@ def main():
         action="store_true",
         help="Score all unscored images with cafeai/cafe_aesthetic and store results",
     )
+    parser.add_argument(
+        "--dedup-md5",
+        action="store_true",
+        help="Fetch md5Checksum from Drive for all indexed files and remove duplicate-content entries",
+    )
 
     args = parser.parse_args()
 
-    if not args.directory and not args.drive_folder and not args.add_aesthetic_scores:
-        parser.error("Provide a local directory, --drive-folder, and/or --add-aesthetic-scores")
+    if not args.directory and not args.drive_folder and not args.add_aesthetic_scores and not args.dedup_md5:
+        parser.error("Provide a local directory, --drive-folder, --add-aesthetic-scores, and/or --dedup-md5")
 
     if args.directory:
         directory = Path(args.directory).resolve()
@@ -679,6 +774,9 @@ def main():
 
     if args.add_aesthetic_scores:
         add_aesthetic_scores()
+
+    if args.dedup_md5:
+        dedup_by_md5()
 
 
 if __name__ == "__main__":

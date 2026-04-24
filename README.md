@@ -149,6 +149,16 @@ uv run --extra drive python embed.py --add-aesthetic-scores
 
 This runs [`cafeai/cafe_aesthetic`](https://huggingface.co/cafeai/cafe_aesthetic) (ViT classifier) on every image and stores a `0–1` quality score in the DB. Local images are scored from disk; Drive images are downloaded to memory. Re-running only scores new (unscored) entries.
 
+### Deduplication by Content
+
+Google Drive's "Make a copy" feature can create files with different names but identical content. To detect and remove these from the index:
+
+```bash
+uv run --extra drive python embed.py --dedup-md5
+```
+
+This fetches `md5Checksum` from the Drive API for every indexed Drive file and removes entries with duplicate content, keeping one per unique image. Future indexing runs also skip files whose md5 already exists in the DB.
+
 Once scored, you can use `sort_by` in `search_images`:
 - `"relevance"` — pure semantic match (default, classic search)
 - `"quality"` — highest aesthetic scores regardless of topic (Nils-style: best photos first)

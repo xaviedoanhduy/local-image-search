@@ -87,7 +87,7 @@ def list_folder_files_with_ids(folder_id: str) -> list[dict]:
                 service.files()
                 .list(
                     q=f"'{fid}' in parents and trashed = false",
-                    fields="nextPageToken, files(id, name, mimeType, webViewLink)",
+                    fields="nextPageToken, files(id, name, mimeType, webViewLink, md5Checksum)",
                     pageSize=200,
                     pageToken=page_token,
                 )
