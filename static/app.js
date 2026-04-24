@@ -58,8 +58,11 @@ async function doSearch() {
       const div = document.createElement('div');
       div.className = 'card';
       div.innerHTML = `
-        <img src="${r.file_id ? `/image/${r.file_id}?size=400` : ''}"
-             loading="lazy" alt="${escHtml(r.filename)}">
+        <div class="card-thumb">
+          <div class="card-thumb-spinner"><span class="spinner"></span></div>
+          <img src="${r.file_id ? `/image/${r.file_id}?size=400` : ''}"
+               loading="lazy" alt="${escHtml(r.filename)}">
+        </div>
         <div class="card-info">
           <div class="card-name" title="${escHtml(r.filename)}">${escHtml(r.filename)}</div>
           <div class="card-scores">
@@ -70,7 +73,9 @@ async function doSearch() {
         </div>`;
 
       const img = div.querySelector('img');
-      img.onerror = () => { img.style.background = 'var(--bg-input)'; };
+      const thumbSpinner = div.querySelector('.card-thumb-spinner');
+      img.onload = () => { thumbSpinner.style.display = 'none'; };
+      img.onerror = () => { thumbSpinner.style.display = 'none'; };
 
       // Attach click handler via JS (no inline onclick, no escaping issues)
       if (r.file_id) {
