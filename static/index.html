@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Trobz Image Search</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <h1>Trobz <span>Image Search</span></h1>
+  <span class="count" id="total"></span>
+</header>
+
+<div class="search-bar">
+  <input type="text" id="q" placeholder="Describe the image you're looking for…" autofocus>
+  <select id="sort" disabled>
+    <option value="combined">Combined (default)</option>
+    <option value="relevance">Relevance only</option>
+    <option value="quality">Quality only</option>
+  </select>
+  <button id="btn" onclick="doSearch()" disabled>Search</button>
+</div>
+
+<div class="meta" id="meta"></div>
+<div class="grid" id="grid">
+  <div class="empty" id="placeholder" style="grid-column:1/-1">Enter a description to search company photos.</div>
+</div>
+
+
+<div id="lb">
+  <button id="lb-close" onclick="closeLb()" title="Close (Esc)">&#x2715;</button>
+  <div id="lb-loading"><span class="spinner"></span></div>
+  <img id="lb-img" src="" alt="" style="display:none">
+  <a id="lb-link" href="#" target="_blank">Open in Google Drive ↗</a>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
