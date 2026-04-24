@@ -186,34 +186,40 @@ async def search(request: SearchRequest):
     return SearchResponse(results=results, total_images=len(paths))
 
 
-@app.get("/image/{file_id}")
-async def proxy_image(file_id: str, size: int = Query(default=800, le=1600)):
-    """Proxy a Drive image — stream from Drive, resize, no local cache required."""
+def _download_and_resize(file_id: str, size: int) -> bytes:
+    """Blocking: download from Drive and resize. Run in a thread pool."""
     import time
     t0 = time.monotonic()
     log.info("drive proxy start file_id=%s size=%d", file_id, size)
+    svc = _drive_svc()
+    request_obj = svc.files().get_media(fileId=file_id)
+    buf = BytesIO()
+    dl = MediaIoBaseDownload(buf, request_obj)
+    done = False
+    while not done:
+        _, done = dl.next_chunk()
+    t_download = time.monotonic() - t0
+    log.info("drive proxy download done file_id=%s download=%.2fs bytes=%d",
+             file_id, t_download, buf.tell())
+    buf.seek(0)
+    img = Image.open(buf).convert("RGB")
+    img.thumbnail((size, size), Image.LANCZOS)
+    out = BytesIO()
+    img.save(out, format="JPEG", quality=85)
+    log.info("drive proxy done file_id=%s total=%.2fs", file_id, time.monotonic() - t0)
+    return out.getvalue()
+
+
+@app.get("/image/{file_id}")
+async def proxy_image(file_id: str, size: int = Query(default=800, le=1600)):
+    """Proxy a Drive image — offloads blocking download to thread pool so requests run in parallel."""
+    import asyncio
+    import time
+    t0 = time.monotonic()
     try:
-        svc = _drive_svc()
-        request_obj = svc.files().get_media(fileId=file_id)
-        buf = BytesIO()
-        dl = MediaIoBaseDownload(buf, request_obj)
-        done = False
-        while not done:
-            _, done = dl.next_chunk()
-        t_download = time.monotonic() - t0
-        log.info("drive proxy download done file_id=%s download=%.2fs bytes=%d",
-                 file_id, t_download, buf.tell())
-        buf.seek(0)
-
-        img = Image.open(buf).convert("RGB")
-        img.thumbnail((size, size), Image.LANCZOS)
-        out = BytesIO()
-        img.save(out, format="JPEG", quality=85)
-        out.seek(0)
-
-        t_total = time.monotonic() - t0
-        log.info("drive proxy done file_id=%s total=%.2fs", file_id, t_total)
-        return StreamingResponse(out, media_type="image/jpeg", headers={
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, _download_and_resize, file_id, size)
+        return StreamingResponse(BytesIO(data), media_type="image/jpeg", headers={
             "Cache-Control": "public, max-age=3600",
         })
     except Exception as e:
